@@ -1,0 +1,16 @@
+[package]
+name = "nana-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+nana-core.workspace = true
+nana-audio.workspace = true
+nana-metrics.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+clap = { version = "4.6.7", features = ["derive"] }
+hound = "3.5.1"

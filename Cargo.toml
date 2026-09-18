@@ -1,0 +1,24 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+rust-version = "1.98"
+
+[workspace.dependencies]
+nana-core = { path = "crates/nana-core" }
+nana-audio = { path = "crates/nana-audio" }
+nana-metrics = { path = "crates/nana-metrics" }
+
+anyhow = "1"
+thiserror = "2"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+serde = { version = "1", features = ["derive"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
