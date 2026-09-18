@@ -1,9 +1,11 @@
+pub mod capture;
 pub mod classify;
 pub mod endpoint;
 pub mod pipewire;
 pub mod registry;
 pub mod ring;
 
+pub use capture::Capture;
 pub use classify::classify_output;
 pub use endpoint::DesktopEndpoints;
 pub use registry::{AudioNode, AudioTopology, DeviceRegistry, NodeDirection};
