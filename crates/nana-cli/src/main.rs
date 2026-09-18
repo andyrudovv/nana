@@ -3,11 +3,13 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use nana_asr::WhisperAsr;
 use nana_audio::capture::{levels, Capture};
 use nana_audio::pipewire::PwDump;
 use nana_audio::registry::{AudioTopology, NodeDirection};
 use nana_audio::{classify_output, DesktopEndpoints};
 use nana_core::endpoint::{AecMode, OutputClass};
+use nana_core::ports::Asr;
 
 #[derive(Parser)]
 #[command(name = "nana", about = "Nana development tools")]
@@ -20,6 +22,16 @@ struct Cli {
 enum Command {
     /// Show audio devices and the endpoint Nana would use right now
     Devices,
+
+    /// Transcribe a 16 kHz mono WAV and report the time it took
+    Transcribe {
+        wav: PathBuf,
+        #[arg(short, long, default_value = "models/ggml-base.bin")]
+        model: PathBuf,
+        /// Repeat to see the spread rather than a single sample
+        #[arg(short, long, default_value_t = 1)]
+        runs: usize,
+    },
 
     /// Capture from the default microphone to check the input path
     Record {
@@ -42,7 +54,53 @@ fn main() -> Result<()> {
     match Cli::parse().command {
         Command::Devices => devices(),
         Command::Record { seconds, out } => record(seconds, out),
+        Command::Transcribe { wav, model, runs } => transcribe(wav, model, runs),
     }
+}
+
+fn transcribe(wav: PathBuf, model: PathBuf, runs: usize) -> Result<()> {
+    nana_asr::install_logging();
+    let samples = read_wav(&wav)?;
+    let audio_seconds = samples.len() as f32 / nana_core::audio::SAMPLE_RATE as f32;
+
+    let loading = Instant::now();
+    let asr = WhisperAsr::load(&model).with_context(|| format!("loading {}", model.display()))?;
+    println!("model {} loaded in {:.2}s", asr.model(), loading.elapsed().as_secs_f32());
+    println!("audio {audio_seconds:.2}s from {}", wav.display());
+
+    for run in 1..=runs.max(1) {
+        let started = Instant::now();
+        let transcript = asr.transcribe(&samples)?;
+        let elapsed = started.elapsed();
+        // Real time factor: below 1.0 means faster than the audio is long.
+        let rtf = elapsed.as_secs_f32() / audio_seconds.max(f32::EPSILON);
+        println!(
+            "\nrun {run}: {:.0} ms  (rtf {rtf:.2})  lang {}  conf {:.2}  no-speech {:.2}",
+            elapsed.as_millis(),
+            transcript.lang.map(|l| l.code()).unwrap_or("?"),
+            transcript.confidence,
+            transcript.no_speech
+        );
+        match (transcript.is_empty(), transcript.is_usable()) {
+            (true, _) => println!("  (no speech recognised)"),
+            (false, false) => println!("  rejected, language not handled: {}", transcript.text),
+            (false, true) => println!("  {}", transcript.text),
+        }
+    }
+    Ok(())
+}
+
+fn read_wav(path: &PathBuf) -> Result<Vec<i16>> {
+    let mut reader =
+        hound::WavReader::open(path).with_context(|| format!("opening {}", path.display()))?;
+    let spec = reader.spec();
+    anyhow::ensure!(
+        spec.channels == 1 && spec.sample_rate == nana_core::audio::SAMPLE_RATE,
+        "expected 16 kHz mono, got {} Hz / {} ch",
+        spec.sample_rate,
+        spec.channels
+    );
+    Ok(reader.samples::<i16>().collect::<std::result::Result<_, _>>()?)
 }
 
 fn record(seconds: f32, out: Option<PathBuf>) -> Result<()> {

@@ -1,0 +1,11 @@
+[package]
+name = "nana-asr"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+nana-core.workspace = true
+tracing.workspace = true
+whisper-rs = "0.16.0"

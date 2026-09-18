@@ -12,6 +12,7 @@ rust-version = "1.98"
 nana-core = { path = "crates/nana-core" }
 nana-audio = { path = "crates/nana-audio" }
 nana-metrics = { path = "crates/nana-metrics" }
+nana-asr = { path = "crates/nana-asr" }
 
 anyhow = "1"
 thiserror = "2"

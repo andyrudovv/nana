@@ -16,6 +16,12 @@ pub enum Error {
     #[error("unsupported capture format: {0}")]
     UnsupportedFormat(String),
 
+    #[error("speech recognition: {0}")]
+    Asr(String),
+
+    #[error("model file not found: {0}")]
+    ModelMissing(std::path::PathBuf),
+
     #[error(transparent)]
     Io(#[from] std::io::Error),
 }
