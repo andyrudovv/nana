@@ -13,7 +13,9 @@ use nana_core::ports::Asr;
 use nana_vad::{
     EndReason, EndpointConfig, Endpointer, SilenceMode, SileroVad, VadEvent, WINDOW_MS,
 };
-use nana_wake::{build_reference, Spotter};
+use nana_wake::{
+    build_reference, transcript_confirms, PreTriggerSilence, Spotter, DEFAULT_SPELLINGS,
+};
 
 #[derive(Parser)]
 #[command(name = "nana", about = "Nana development tools")]
@@ -41,7 +43,7 @@ enum WakeAction {
         #[arg(short, long, default_value = "models/wake/samples")]
         dir: PathBuf,
     },
-    /// Listen on the microphone
+    /// Listen on the microphone with the full false-activation gate
     Listen {
         #[arg(short, long, default_value = "models/wake/nana.rpw")]
         wakeword: PathBuf,
@@ -49,6 +51,9 @@ enum WakeAction {
         threshold: f32,
         #[arg(short, long, default_value_t = 30.0)]
         seconds: f32,
+        /// Report every candidate, including the ones the gate rejects
+        #[arg(short, long)]
+        verbose: bool,
     },
     /// Score a WAV against a wake word
     Scan {
@@ -127,8 +132,8 @@ fn wake(action: WakeAction) -> Result<()> {
     match action {
         WakeAction::Record { name, count, dir } => wake_record(&name, count, &dir),
         WakeAction::Build { name, dir } => wake_build(&name, &dir),
-        WakeAction::Listen { wakeword, threshold, seconds } => {
-            wake_listen(&wakeword, threshold, seconds)
+        WakeAction::Listen { wakeword, threshold, seconds, verbose } => {
+            wake_listen(&wakeword, threshold, seconds, verbose)
         }
         WakeAction::Scan { wav, wakeword, threshold } => wake_scan(&wav, &wakeword, threshold),
     }
@@ -251,31 +256,99 @@ fn wake_scan(wav: &Path, wakeword: &Path, threshold: f32) -> Result<()> {
     Ok(())
 }
 
-fn wake_listen(wakeword: &Path, threshold: f32, seconds: f32) -> Result<()> {
+/// Runs the layered gate a short wake word needs.
+///
+/// The spotter only proposes; a candidate becomes an activation after it also
+/// begins a fresh burst of speech and the recogniser confirms the word stands
+/// on its own rather than inside another one.
+fn wake_listen(wakeword: &Path, threshold: f32, seconds: f32, verbose: bool) -> Result<()> {
     let mut spotter = Spotter::load(wakeword, threshold)?;
+    let mut vad = SileroVad::load("models/silero_vad.onnx")?;
+    let mut gate = PreTriggerSilence::new(300, 900, 0.5);
+    let asr = WhisperAsr::load("models/ggml-base.bin").context("loading the recogniser")?;
+    asr.warm_up()?;
+
     let capture = Capture::start_default().context("could not open the default microphone")?;
-    println!("listening for {} at threshold {threshold:.2} for {seconds:.0}s", wakeword.display());
+    println!("listening for {} at threshold {threshold:.2}", wakeword.display());
+    println!(
+        "gate: 300 ms quiet before the word, at most 900 ms into a burst, then transcript check\n"
+    );
 
     let started = Instant::now();
+    let window = nana_core::audio::VAD_WINDOW_SAMPLES;
     let mut cursor = 0u64;
-    let mut hits = 0usize;
-    let mut best = 0.0f32;
+    let mut pending: Vec<i16> = Vec::new();
+    let mut stats = GateStats::default();
+
     while started.elapsed() < Duration::from_secs_f32(seconds) {
         std::thread::sleep(Duration::from_millis(30));
         let Some((samples, next)) = capture.read_from(cursor) else {
-            println!("  fell behind the ring; resyncing");
             cursor = capture.captured();
             continue;
         };
         cursor = next;
-        if let Some(d) = spotter.push(&samples) {
-            hits += 1;
-            println!("  DETECTED at {:.1}s  score {:.3}", started.elapsed().as_secs_f32(), d.score);
+        if samples.is_empty() {
+            continue;
         }
-        best = best.max(spotter.partial_score().unwrap_or(0.0));
+
+        pending.extend_from_slice(&samples);
+        while pending.len() >= window {
+            let chunk: Vec<i16> = pending.drain(..window).collect();
+            gate.push(vad.probe(&chunk)?);
+        }
+
+        let Some(detection) = spotter.push(&samples) else { continue };
+        stats.candidates += 1;
+        let at = started.elapsed().as_secs_f32();
+
+        if !gate.satisfied() {
+            stats.rejected_by_burst += 1;
+            if verbose {
+                println!(
+                    "  [{at:5.1}s] rejected: {} ms into a burst (quiet before it {} ms), score {:.3}",
+                    gate.burst_ms(),
+                    gate.quiet_before_burst_ms(),
+                    detection.score
+                );
+            }
+            continue;
+        }
+
+        let heard = capture.tail(nana_core::audio::seconds_to_samples(2.0));
+        let transcript = asr.transcribe(&heard)?;
+        if !transcript_confirms(&transcript.text, &DEFAULT_SPELLINGS) {
+            stats.rejected_by_transcript += 1;
+            if verbose {
+                println!(
+                    "  [{at:5.1}s] rejected: heard {:?}, score {:.3}",
+                    transcript.text.trim(),
+                    detection.score
+                );
+            }
+            continue;
+        }
+
+        stats.activated += 1;
+        println!(
+            "  [{at:5.1}s] ACTIVATED  score {:.3}  heard {:?}",
+            detection.score,
+            transcript.text.trim()
+        );
     }
-    println!("{hits} detection(s), best partial score {best:.3}");
+
+    println!(
+        "\n{} candidate(s): {} activated, {} rejected as mid-burst, {} rejected by transcript",
+        stats.candidates, stats.activated, stats.rejected_by_burst, stats.rejected_by_transcript
+    );
     Ok(())
+}
+
+#[derive(Default)]
+struct GateStats {
+    candidates: usize,
+    activated: usize,
+    rejected_by_burst: usize,
+    rejected_by_transcript: usize,
 }
 
 fn vad(wav: PathBuf, model: PathBuf) -> Result<()> {
