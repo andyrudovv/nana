@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use nana_asr::WhisperAsr;
+use nana_asr::{AudioCtx, WhisperAsr};
 use nana_audio::capture::{levels, Capture};
 use nana_audio::pipewire::PwDump;
 use nana_audio::registry::{AudioTopology, NodeDirection};
@@ -39,6 +39,12 @@ enum Command {
         /// Repeat to see the spread rather than a single sample
         #[arg(short, long, default_value_t = 1)]
         runs: usize,
+        /// Encoder audio context. "auto" sizes it to the clip, a number pins it.
+        #[arg(short, long, default_value = "auto")]
+        audio_ctx: String,
+        /// Re-enable whisper's temperature retries, removing the latency ceiling
+        #[arg(long)]
+        temperature_fallback: bool,
     },
 
     /// Capture from the default microphone to check the input path
@@ -62,7 +68,9 @@ fn main() -> Result<()> {
     match Cli::parse().command {
         Command::Devices => devices(),
         Command::Record { seconds, out } => record(seconds, out),
-        Command::Transcribe { wav, model, runs } => transcribe(wav, model, runs),
+        Command::Transcribe { wav, model, runs, audio_ctx, temperature_fallback } => {
+            transcribe(wav, model, runs, &audio_ctx, temperature_fallback)
+        }
         Command::Vad { wav, model } => vad(wav, model),
     }
 }
@@ -127,15 +135,37 @@ fn vad(wav: PathBuf, model: PathBuf) -> Result<()> {
     Ok(())
 }
 
-fn transcribe(wav: PathBuf, model: PathBuf, runs: usize) -> Result<()> {
+fn transcribe(
+    wav: PathBuf,
+    model: PathBuf,
+    runs: usize,
+    audio_ctx: &str,
+    temperature_fallback: bool,
+) -> Result<()> {
     nana_asr::install_logging();
     let samples = read_wav(&wav)?;
     let audio_seconds = samples.len() as f32 / nana_core::audio::SAMPLE_RATE as f32;
 
     let loading = Instant::now();
-    let asr = WhisperAsr::load(&model).with_context(|| format!("loading {}", model.display()))?;
+    let ctx = match audio_ctx {
+        "full" => AudioCtx::Full,
+        "auto" => AudioCtx::Auto,
+        value => {
+            AudioCtx::Fixed(value.parse().context("--audio-ctx wants full, auto or a number")?)
+        }
+    };
+    let asr = WhisperAsr::load(&model)
+        .with_context(|| format!("loading {}", model.display()))?
+        .with_audio_ctx(ctx);
+    let asr = if temperature_fallback { asr.with_temperature_fallback() } else { asr };
     println!("model {} loaded in {:.2}s", asr.model(), loading.elapsed().as_secs_f32());
-    println!("audio {audio_seconds:.2}s from {}", wav.display());
+    println!(
+        "audio {audio_seconds:.2}s from {}  (audio-ctx {:?} -> {:?})",
+        wav.display(),
+        ctx,
+        ctx.frames(audio_seconds)
+    );
+    asr.warm_up()?;
 
     for run in 1..=runs.max(1) {
         let started = Instant::now();
