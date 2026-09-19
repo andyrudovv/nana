@@ -16,6 +16,9 @@ pub enum Error {
     #[error("unsupported capture format: {0}")]
     UnsupportedFormat(String),
 
+    #[error("voice activity detection: {0}")]
+    Vad(String),
+
     #[error("speech recognition: {0}")]
     Asr(String),
 

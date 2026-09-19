@@ -1,0 +1,11 @@
+[package]
+name = "nana-vad"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+nana-core.workspace = true
+tracing.workspace = true
+ort = "2.0.0-rc.13"

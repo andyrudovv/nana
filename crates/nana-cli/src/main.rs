@@ -10,6 +10,7 @@ use nana_audio::registry::{AudioTopology, NodeDirection};
 use nana_audio::{classify_output, DesktopEndpoints};
 use nana_core::endpoint::{AecMode, OutputClass};
 use nana_core::ports::Asr;
+use nana_vad::{EndReason, EndpointConfig, Endpointer, SileroVad, VadEvent, WINDOW_MS};
 
 #[derive(Parser)]
 #[command(name = "nana", about = "Nana development tools")]
@@ -22,6 +23,13 @@ struct Cli {
 enum Command {
     /// Show audio devices and the endpoint Nana would use right now
     Devices,
+
+    /// Run voice activity detection over a 16 kHz mono WAV
+    Vad {
+        wav: PathBuf,
+        #[arg(short, long, default_value = "models/silero_vad.onnx")]
+        model: PathBuf,
+    },
 
     /// Transcribe a 16 kHz mono WAV and report the time it took
     Transcribe {
@@ -47,7 +55,7 @@ fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_env("NANA_LOG")
-                .unwrap_or_else(|_| "info".into()),
+                .unwrap_or_else(|_| "info,ort=warn,whisper_rs=warn".into()),
         )
         .init();
 
@@ -55,7 +63,59 @@ fn main() -> Result<()> {
         Command::Devices => devices(),
         Command::Record { seconds, out } => record(seconds, out),
         Command::Transcribe { wav, model, runs } => transcribe(wav, model, runs),
+        Command::Vad { wav, model } => vad(wav, model),
     }
+}
+
+fn vad(wav: PathBuf, model: PathBuf) -> Result<()> {
+    let samples = read_wav(&wav)?;
+    let mut detector =
+        SileroVad::load(&model).with_context(|| format!("loading {}", model.display()))?;
+    let mut endpointer = Endpointer::new(EndpointConfig::default());
+
+    let mut inference = Duration::ZERO;
+    let mut windows = 0usize;
+    let mut speech_windows = 0usize;
+    let mut start_ms = 0u32;
+
+    println!("{} — {:.2}s", wav.display(), samples.len() as f32 / 16_000.0);
+    let (windows_of_audio, _remainder) =
+        samples.as_chunks::<{ nana_core::audio::VAD_WINDOW_SAMPLES }>();
+    for chunk in windows_of_audio {
+        let at = Instant::now();
+        let probability = detector.probe(chunk)?;
+        inference += at.elapsed();
+        let now_ms = windows as u32 * WINDOW_MS;
+        windows += 1;
+        if probability >= 0.5 {
+            speech_windows += 1;
+        }
+        match endpointer.push(probability) {
+            Some(VadEvent::SpeechStart) => start_ms = now_ms,
+            Some(VadEvent::SpeechEnd { speech_ms, reason }) => {
+                let tag = match reason {
+                    EndReason::Silence => "silence",
+                    EndReason::TooLong => "cut, too long",
+                };
+                println!(
+                    "  speech {:.2}s..{:.2}s  ({speech_ms} ms, {tag})",
+                    start_ms as f32 / 1000.0,
+                    (start_ms + speech_ms) as f32 / 1000.0
+                );
+            }
+            None => {}
+        }
+    }
+
+    let per_window = inference.as_secs_f64() * 1000.0 / windows.max(1) as f64;
+    println!(
+        "{windows} windows, {speech_windows} above threshold ({:.0}%), {per_window:.3} ms per window",
+        100.0 * speech_windows as f64 / windows.max(1) as f64
+    );
+    if speech_windows == 0 {
+        println!("  no speech detected");
+    }
+    Ok(())
 }
 
 fn transcribe(wav: PathBuf, model: PathBuf, runs: usize) -> Result<()> {
