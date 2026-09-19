@@ -83,6 +83,18 @@ impl Capture {
         self.ring.lock().expect("ring mutex poisoned").tail(count)
     }
 
+    /// Samples written since `cursor`, with the cursor to use next.
+    ///
+    /// Returns `None` when the window has already been overwritten: a
+    /// real-time consumer has to know it fell behind rather than silently
+    /// resume from wherever it lands.
+    pub fn read_from(&self, cursor: u64) -> Option<(Vec<i16>, u64)> {
+        let ring = self.ring.lock().expect("ring mutex poisoned");
+        let available = ring.written().saturating_sub(cursor) as usize;
+        let samples = ring.range(cursor, available)?;
+        Some((samples, cursor + available as u64))
+    }
+
     pub fn captured(&self) -> u64 {
         self.ring.lock().expect("ring mutex poisoned").written()
     }

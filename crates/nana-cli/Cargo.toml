@@ -11,6 +11,7 @@ nana-audio.workspace = true
 nana-metrics.workspace = true
 nana-asr.workspace = true
 nana-vad.workspace = true
+nana-wake.workspace = true
 anyhow.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

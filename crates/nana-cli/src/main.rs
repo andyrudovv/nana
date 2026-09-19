@@ -11,6 +11,7 @@ use nana_audio::{classify_output, DesktopEndpoints};
 use nana_core::endpoint::{AecMode, OutputClass};
 use nana_core::ports::Asr;
 use nana_vad::{EndReason, EndpointConfig, Endpointer, SileroVad, VadEvent, WINDOW_MS};
+use nana_wake::WakeWord;
 
 #[derive(Parser)]
 #[command(name = "nana", about = "Nana development tools")]
@@ -23,6 +24,19 @@ struct Cli {
 enum Command {
     /// Show audio devices and the endpoint Nana would use right now
     Devices,
+
+    /// Score a wake word against a WAV, or live from the microphone
+    Wake {
+        /// WAV to scan; omit to listen on the default microphone
+        wav: Option<PathBuf>,
+        #[arg(short, long, default_value = "models/wake/hey_jarvis_v0.1.onnx")]
+        classifier: PathBuf,
+        #[arg(short, long, default_value_t = 0.5)]
+        threshold: f32,
+        /// How long to listen for, in seconds
+        #[arg(short, long, default_value_t = 30.0)]
+        seconds: f32,
+    },
 
     /// Run voice activity detection over a 16 kHz mono WAV
     Vad {
@@ -72,7 +86,77 @@ fn main() -> Result<()> {
             transcribe(wav, model, runs, &audio_ctx, temperature_fallback)
         }
         Command::Vad { wav, model } => vad(wav, model),
+        Command::Wake { wav, classifier, threshold, seconds } => {
+            wake(wav, classifier, threshold, seconds)
+        }
     }
+}
+
+fn wake(wav: Option<PathBuf>, classifier: PathBuf, threshold: f32, seconds: f32) -> Result<()> {
+    let mut detector = WakeWord::load("models/wake", &classifier)
+        .with_context(|| format!("loading {}", classifier.display()))?
+        .with_threshold(threshold);
+    let name = classifier.file_stem().unwrap_or_default().to_string_lossy().into_owned();
+
+    match wav {
+        Some(path) => {
+            let samples = read_wav(&path)?;
+            let (scores, detection) = detector.push(&samples)?;
+            report_scores(&name, &scores);
+            match detection {
+                Some(d) => {
+                    println!("  DETECTED at {:.2}s, score {:.3}", d.at_ms as f32 / 1000.0, d.score)
+                }
+                None => println!("  no detection"),
+            }
+        }
+        None => listen_for_wake(&mut detector, &name, threshold, seconds)?,
+    }
+    Ok(())
+}
+
+fn listen_for_wake(
+    detector: &mut WakeWord,
+    name: &str,
+    threshold: f32,
+    seconds: f32,
+) -> Result<()> {
+    let capture = Capture::start_default().context("could not open the default microphone")?;
+    println!("listening for \"{name}\" at threshold {threshold:.2} for {seconds:.0}s");
+
+    let started = Instant::now();
+    let mut cursor = 0u64;
+    let mut peak = 0.0f32;
+    let mut hits = 0usize;
+    while started.elapsed() < Duration::from_secs_f32(seconds) {
+        std::thread::sleep(Duration::from_millis(40));
+        let Some((samples, next)) = capture.read_from(cursor) else {
+            println!("  fell behind the ring; resyncing");
+            cursor = capture.captured();
+            continue;
+        };
+        cursor = next;
+        if samples.is_empty() {
+            continue;
+        }
+        let (scores, detection) = detector.push(&samples)?;
+        for score in scores {
+            peak = peak.max(score);
+        }
+        if let Some(d) = detection {
+            hits += 1;
+            println!("  DETECTED at {:.1}s, score {:.3}", started.elapsed().as_secs_f32(), d.score);
+        }
+    }
+    println!("peak score {peak:.3}, {hits} detection(s)");
+    Ok(())
+}
+
+fn report_scores(name: &str, scores: &[f32]) {
+    let peak = scores.iter().cloned().fold(0.0f32, f32::max);
+    let mean =
+        if scores.is_empty() { 0.0 } else { scores.iter().sum::<f32>() / scores.len() as f32 };
+    println!("{name}: {} steps, peak {peak:.3}, mean {mean:.4}", scores.len());
 }
 
 fn vad(wav: PathBuf, model: PathBuf) -> Result<()> {

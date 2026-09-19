@@ -693,6 +693,7 @@ dependencies = [
  "nana-core",
  "nana-metrics",
  "nana-vad",
+ "nana-wake",
  "tracing",
  "tracing-subscriber",
 ]
@@ -716,6 +717,16 @@ dependencies = [
 
 [[package]]
 name = "nana-vad"
+version = "0.1.0"
+dependencies = [
+ "hound",
+ "nana-core",
+ "ort",
+ "tracing",
+]
+
+[[package]]
+name = "nana-wake"
 version = "0.1.0"
 dependencies = [
  "hound",
