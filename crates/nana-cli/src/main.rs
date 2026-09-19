@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
@@ -10,8 +10,10 @@ use nana_audio::registry::{AudioTopology, NodeDirection};
 use nana_audio::{classify_output, DesktopEndpoints};
 use nana_core::endpoint::{AecMode, OutputClass};
 use nana_core::ports::Asr;
-use nana_vad::{EndReason, EndpointConfig, Endpointer, SileroVad, VadEvent, WINDOW_MS};
-use nana_wake::WakeWord;
+use nana_vad::{
+    EndReason, EndpointConfig, Endpointer, SilenceMode, SileroVad, VadEvent, WINDOW_MS,
+};
+use nana_wake::{build_reference, Spotter};
 
 #[derive(Parser)]
 #[command(name = "nana", about = "Nana development tools")]
@@ -21,21 +23,52 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
+enum WakeAction {
+    /// Record samples of the phrase, trimmed to speech by VAD
+    Record {
+        #[arg(short, long, default_value = "nana")]
+        name: String,
+        /// rustpotter wants 3 to 8; more cost proportionally more CPU
+        #[arg(short, long, default_value_t = 6)]
+        count: usize,
+        #[arg(short, long, default_value = "models/wake/samples")]
+        dir: PathBuf,
+    },
+    /// Build a wake word reference from recorded samples
+    Build {
+        #[arg(short, long, default_value = "nana")]
+        name: String,
+        #[arg(short, long, default_value = "models/wake/samples")]
+        dir: PathBuf,
+    },
+    /// Listen on the microphone
+    Listen {
+        #[arg(short, long, default_value = "models/wake/nana.rpw")]
+        wakeword: PathBuf,
+        #[arg(short, long, default_value_t = 0.5)]
+        threshold: f32,
+        #[arg(short, long, default_value_t = 30.0)]
+        seconds: f32,
+    },
+    /// Score a WAV against a wake word
+    Scan {
+        wav: PathBuf,
+        #[arg(short, long, default_value = "models/wake/nana.rpw")]
+        wakeword: PathBuf,
+        #[arg(short, long, default_value_t = 0.5)]
+        threshold: f32,
+    },
+}
+
+#[derive(Subcommand)]
 enum Command {
     /// Show audio devices and the endpoint Nana would use right now
     Devices,
 
-    /// Score a wake word against a WAV, or live from the microphone
+    /// Record samples, build a wake word from them, or run detection
     Wake {
-        /// WAV to scan; omit to listen on the default microphone
-        wav: Option<PathBuf>,
-        #[arg(short, long, default_value = "models/wake/hey_jarvis_v0.1.onnx")]
-        classifier: PathBuf,
-        #[arg(short, long, default_value_t = 0.5)]
-        threshold: f32,
-        /// How long to listen for, in seconds
-        #[arg(short, long, default_value_t = 30.0)]
-        seconds: f32,
+        #[command(subcommand)]
+        action: WakeAction,
     },
 
     /// Run voice activity detection over a 16 kHz mono WAV
@@ -86,77 +119,163 @@ fn main() -> Result<()> {
             transcribe(wav, model, runs, &audio_ctx, temperature_fallback)
         }
         Command::Vad { wav, model } => vad(wav, model),
-        Command::Wake { wav, classifier, threshold, seconds } => {
-            wake(wav, classifier, threshold, seconds)
+        Command::Wake { action } => wake(action),
+    }
+}
+
+fn wake(action: WakeAction) -> Result<()> {
+    match action {
+        WakeAction::Record { name, count, dir } => wake_record(&name, count, &dir),
+        WakeAction::Build { name, dir } => wake_build(&name, &dir),
+        WakeAction::Listen { wakeword, threshold, seconds } => {
+            wake_listen(&wakeword, threshold, seconds)
+        }
+        WakeAction::Scan { wav, wakeword, threshold } => wake_scan(&wav, &wakeword, threshold),
+    }
+}
+
+/// Captures one utterance per prompt, trimmed to the speech VAD found.
+///
+/// Trimming matters more here than at runtime: the reference is compared by
+/// dynamic time warping, so leading silence in a sample distorts every later
+/// match against it.
+fn wake_record(name: &str, count: usize, dir: &Path) -> Result<()> {
+    std::fs::create_dir_all(dir)?;
+    let mut detector = SileroVad::load("models/silero_vad.onnx")?;
+    let capture = Capture::start_default_with_capacity(16_000 * 10)
+        .context("could not open the default microphone")?;
+
+    println!("recording {count} samples into {}", dir.display());
+    println!("say the phrase after each prompt, then pause\n");
+
+    for index in 1..=count {
+        println!("  [{index}/{count}] speak now");
+        let segment = record_one_utterance(&capture, &mut detector)?;
+        let path = dir.join(format!("{name}_{index}.wav"));
+        write_wav(&path, &segment)?;
+        println!(
+            "        {:.2}s -> {}",
+            segment.len() as f32 / nana_core::audio::SAMPLE_RATE as f32,
+            path.display()
+        );
+        std::thread::sleep(Duration::from_millis(700));
+    }
+    println!("\nnow run: nana-cli wake build --name {name}");
+    Ok(())
+}
+
+fn record_one_utterance(capture: &Capture, detector: &mut SileroVad) -> Result<Vec<i16>> {
+    const PAD_MS: usize = 120;
+    let window = nana_core::audio::VAD_WINDOW_SAMPLES;
+    let pad = PAD_MS * nana_core::audio::SAMPLE_RATE as usize / 1000;
+
+    let mut endpointer = Endpointer::new(EndpointConfig::default());
+    detector.reset();
+    let mut cursor = capture.captured();
+    let mut local: Vec<i16> = Vec::new();
+    let mut consumed = 0usize;
+    let mut start_at = 0usize;
+    let deadline = Instant::now() + Duration::from_secs(12);
+
+    loop {
+        anyhow::ensure!(Instant::now() < deadline, "no speech heard in 12s");
+        std::thread::sleep(Duration::from_millis(30));
+        let Some((samples, next)) = capture.read_from(cursor) else {
+            cursor = capture.captured();
+            continue;
+        };
+        cursor = next;
+        local.extend_from_slice(&samples);
+
+        while consumed + window <= local.len() {
+            let probability = detector.probe(&local[consumed..consumed + window])?;
+            consumed += window;
+            match endpointer.push(probability) {
+                Some(VadEvent::SpeechStart) => {
+                    start_at = consumed.saturating_sub(window * 12);
+                }
+                Some(VadEvent::SpeechEnd { .. }) => {
+                    // Drop the trailing silence the endpointer waited through.
+                    let silence = SilenceMode::Base.millis() as usize
+                        * nana_core::audio::SAMPLE_RATE as usize
+                        / 1000;
+                    let end = consumed.saturating_sub(silence);
+                    let from = start_at.saturating_sub(pad);
+                    let to = (end + pad).min(local.len());
+                    anyhow::ensure!(to > from, "captured an empty segment");
+                    return Ok(local[from..to].to_vec());
+                }
+                None => {}
+            }
         }
     }
 }
 
-fn wake(wav: Option<PathBuf>, classifier: PathBuf, threshold: f32, seconds: f32) -> Result<()> {
-    let mut detector = WakeWord::load("models/wake", &classifier)
-        .with_context(|| format!("loading {}", classifier.display()))?
-        .with_threshold(threshold);
-    let name = classifier.file_stem().unwrap_or_default().to_string_lossy().into_owned();
+fn wake_build(name: &str, dir: &Path) -> Result<()> {
+    let mut samples: Vec<PathBuf> = std::fs::read_dir(dir)
+        .with_context(|| format!("reading {}", dir.display()))?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| {
+            p.extension().is_some_and(|e| e == "wav")
+                && p.file_name().is_some_and(|n| n.to_string_lossy().starts_with(name))
+        })
+        .collect();
+    samples.sort();
+    anyhow::ensure!(!samples.is_empty(), "no {name}_*.wav files in {}", dir.display());
 
-    match wav {
-        Some(path) => {
-            let samples = read_wav(&path)?;
-            let (scores, detection) = detector.push(&samples)?;
-            report_scores(&name, &scores);
-            match detection {
-                Some(d) => {
-                    println!("  DETECTED at {:.2}s, score {:.3}", d.at_ms as f32 / 1000.0, d.score)
-                }
-                None => println!("  no detection"),
-            }
-        }
-        None => listen_for_wake(&mut detector, &name, threshold, seconds)?,
+    let out = dir.parent().unwrap_or(Path::new(".")).join(format!("{name}.rpw"));
+    let used = build_reference(name, &samples, &out)?;
+    println!("built {} from {used} samples", out.display());
+    for s in &samples {
+        println!("  {}", s.display());
     }
     Ok(())
 }
 
-fn listen_for_wake(
-    detector: &mut WakeWord,
-    name: &str,
-    threshold: f32,
-    seconds: f32,
-) -> Result<()> {
+fn wake_scan(wav: &Path, wakeword: &Path, threshold: f32) -> Result<()> {
+    let samples = read_wav(&wav.to_path_buf())?;
+    let mut spotter = Spotter::load(wakeword, threshold)?;
+    match spotter.push(&samples) {
+        Some(d) => println!(
+            "DETECTED \"{}\" at {:.2}s  score {:.3}  avg {:.3}",
+            d.name,
+            d.at_ms as f32 / 1000.0,
+            d.score,
+            d.avg_score
+        ),
+        None => println!(
+            "no detection (best partial {:.3}, threshold {threshold:.2})",
+            spotter.partial_score().unwrap_or(0.0)
+        ),
+    }
+    Ok(())
+}
+
+fn wake_listen(wakeword: &Path, threshold: f32, seconds: f32) -> Result<()> {
+    let mut spotter = Spotter::load(wakeword, threshold)?;
     let capture = Capture::start_default().context("could not open the default microphone")?;
-    println!("listening for \"{name}\" at threshold {threshold:.2} for {seconds:.0}s");
+    println!("listening for {} at threshold {threshold:.2} for {seconds:.0}s", wakeword.display());
 
     let started = Instant::now();
     let mut cursor = 0u64;
-    let mut peak = 0.0f32;
     let mut hits = 0usize;
+    let mut best = 0.0f32;
     while started.elapsed() < Duration::from_secs_f32(seconds) {
-        std::thread::sleep(Duration::from_millis(40));
+        std::thread::sleep(Duration::from_millis(30));
         let Some((samples, next)) = capture.read_from(cursor) else {
             println!("  fell behind the ring; resyncing");
             cursor = capture.captured();
             continue;
         };
         cursor = next;
-        if samples.is_empty() {
-            continue;
-        }
-        let (scores, detection) = detector.push(&samples)?;
-        for score in scores {
-            peak = peak.max(score);
-        }
-        if let Some(d) = detection {
+        if let Some(d) = spotter.push(&samples) {
             hits += 1;
-            println!("  DETECTED at {:.1}s, score {:.3}", started.elapsed().as_secs_f32(), d.score);
+            println!("  DETECTED at {:.1}s  score {:.3}", started.elapsed().as_secs_f32(), d.score);
         }
+        best = best.max(spotter.partial_score().unwrap_or(0.0));
     }
-    println!("peak score {peak:.3}, {hits} detection(s)");
+    println!("{hits} detection(s), best partial score {best:.3}");
     Ok(())
-}
-
-fn report_scores(name: &str, scores: &[f32]) {
-    let peak = scores.iter().cloned().fold(0.0f32, f32::max);
-    let mean =
-        if scores.is_empty() { 0.0 } else { scores.iter().sum::<f32>() / scores.len() as f32 };
-    println!("{name}: {} steps, peak {peak:.3}, mean {mean:.4}", scores.len());
 }
 
 fn vad(wav: PathBuf, model: PathBuf) -> Result<()> {

@@ -9,6 +9,11 @@ rust-version.workspace = true
 nana-core.workspace = true
 tracing.workspace = true
 ort = "2.0.0-rc.13"
+rustpotter = "3.0.2"
+# Not used directly. rustpotter pulls candle 0.2.2, which expects half's
+# rand_distr support; newer half moved it behind a feature, so enabling it
+# here through feature unification is what makes candle compile at all.
+half = { version = "=2.4.1", features = ["rand_distr"] }
 
 [dev-dependencies]
 hound = "3.5.1"
