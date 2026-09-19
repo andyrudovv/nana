@@ -718,6 +718,7 @@ dependencies = [
 name = "nana-vad"
 version = "0.1.0"
 dependencies = [
+ "hound",
  "nana-core",
  "ort",
  "tracing",

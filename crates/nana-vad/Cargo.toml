@@ -9,3 +9,6 @@ rust-version.workspace = true
 nana-core.workspace = true
 tracing.workspace = true
 ort = "2.0.0-rc.13"
+
+[dev-dependencies]
+hound = "3.5.1"

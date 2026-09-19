@@ -73,6 +73,7 @@ fn vad(wav: PathBuf, model: PathBuf) -> Result<()> {
         SileroVad::load(&model).with_context(|| format!("loading {}", model.display()))?;
     let mut endpointer = Endpointer::new(EndpointConfig::default());
 
+    let mut probabilities: Vec<f32> = Vec::new();
     let mut inference = Duration::ZERO;
     let mut windows = 0usize;
     let mut speech_windows = 0usize;
@@ -85,6 +86,7 @@ fn vad(wav: PathBuf, model: PathBuf) -> Result<()> {
         let at = Instant::now();
         let probability = detector.probe(chunk)?;
         inference += at.elapsed();
+        probabilities.push(probability);
         let now_ms = windows as u32 * WINDOW_MS;
         windows += 1;
         if probability >= 0.5 {
@@ -112,6 +114,13 @@ fn vad(wav: PathBuf, model: PathBuf) -> Result<()> {
         "{windows} windows, {speech_windows} above threshold ({:.0}%), {per_window:.3} ms per window",
         100.0 * speech_windows as f64 / windows.max(1) as f64
     );
+    if let Some(max) =
+        probabilities.iter().cloned().fold(None::<f32>, |m, p| Some(m.map_or(p, |m: f32| m.max(p))))
+    {
+        let mean = probabilities.iter().sum::<f32>() / probabilities.len() as f32;
+        let min = probabilities.iter().cloned().fold(f32::INFINITY, f32::min);
+        println!("probability  min {min:.4}  mean {mean:.4}  max {max:.4}");
+    }
     if speech_windows == 0 {
         println!("  no speech detected");
     }
