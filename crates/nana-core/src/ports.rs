@@ -3,6 +3,10 @@
 //! Kept deliberately narrow so a provider can be swapped without the state
 //! machine noticing (R4).
 
+use std::pin::Pin;
+
+use futures_core::Stream;
+
 use crate::lang::Lang;
 use crate::Result;
 
@@ -43,6 +47,60 @@ pub trait Asr: Send + Sync {
     fn transcribe(&self, pcm: &[i16]) -> Result<Transcript>;
 
     /// Human-readable model identity, for telemetry and benchmark output.
+    fn model(&self) -> &str;
+}
+
+/// Who said a turn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Role {
+    User,
+    Assistant,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Message {
+    pub role: Role,
+    pub content: String,
+}
+
+/// Provider-neutral request. Tool definitions will join it later; nothing
+/// here may assume one vendor's wire format.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BrainRequest {
+    /// Persona and spoken-style rules: the stable prefix worth caching.
+    pub system: String,
+    pub messages: Vec<Message>,
+    pub max_tokens: u32,
+}
+
+/// Token accounting for one reply. Cache fields stay zero where the
+/// provider has no prompt cache.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Usage {
+    pub input_tokens: u32,
+    pub output_tokens: u32,
+    pub cache_read_tokens: u32,
+    pub cache_write_tokens: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BrainEvent {
+    /// A piece of the reply, in order. Chunking for TTS happens downstream.
+    Text(String),
+    /// Always the last event of a successful stream.
+    Done { usage: Usage, stop_reason: Option<String> },
+}
+
+pub type BrainStream = Pin<Box<dyn Stream<Item = Result<BrainEvent>> + Send>>;
+
+/// The language model behind Nana. The orchestrator sees only this, so a
+/// cloud model and a local one are interchangeable by configuration.
+pub trait Brain: Send + Sync {
+    /// Starts a reply and yields it as it is generated. Dropping the stream
+    /// cancels the request, which is what barge-in relies on.
+    fn stream(&self, request: BrainRequest) -> BrainStream;
+
+    /// Model identity, for telemetry and benchmark output.
     fn model(&self) -> &str;
 }
 

@@ -15,6 +15,7 @@ nana-metrics = { path = "crates/nana-metrics" }
 nana-asr = { path = "crates/nana-asr" }
 nana-vad = { path = "crates/nana-vad" }
 nana-wake = { path = "crates/nana-wake" }
+nana-llm = { path = "crates/nana-llm" }
 
 anyhow = "1"
 thiserror = "2"

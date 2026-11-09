@@ -25,6 +25,9 @@ pub enum Error {
     #[error("speech recognition: {0}")]
     Asr(String),
 
+    #[error("language model: {0}")]
+    Llm(String),
+
     #[error("model file not found: {0}")]
     ModelMissing(std::path::PathBuf),
 

@@ -100,6 +100,21 @@ enum Command {
         temperature_fallback: bool,
     },
 
+    /// Ask Claude one question and report time to first token and cache use
+    Ask {
+        text: String,
+        #[arg(short, long, default_value = nana_llm::DEFAULT_MODEL)]
+        model: String,
+        /// Replaces the built-in spoken-style prompt
+        #[arg(short, long)]
+        system: Option<String>,
+        #[arg(long, default_value_t = 300)]
+        max_tokens: u32,
+        /// Repeat the same request to watch the prompt cache warm up
+        #[arg(short, long, default_value_t = 1)]
+        runs: usize,
+    },
+
     /// Capture from the default microphone to check the input path
     Record {
         #[arg(short, long, default_value_t = 5.0)]
@@ -125,8 +140,71 @@ fn main() -> Result<()> {
             transcribe(wav, model, runs, &audio_ctx, temperature_fallback)
         }
         Command::Vad { wav, model } => vad(wav, model),
+        Command::Ask { text, model, system, max_tokens, runs } => {
+            ask(&text, &model, system, max_tokens, runs)
+        }
         Command::Wake { action } => wake(action),
     }
+}
+
+/// Spoken-style rules from the design, enough to hear the register.
+const ASK_SYSTEM: &str = "Ты голосовой ассистент Нана. Отвечай по-человечески, \
+в один-три коротких предложения, без списков, markdown и эмодзи. Числа пиши словами. \
+Отвечай на языке собеседника.";
+
+fn ask(
+    text: &str,
+    model: &str,
+    system: Option<String>,
+    max_tokens: u32,
+    runs: usize,
+) -> Result<()> {
+    use futures_util::StreamExt;
+    use nana_core::ports::{Brain, BrainEvent, BrainRequest, Message, Role};
+
+    let key = std::env::var("ANTHROPIC_API_KEY")
+        .context("ANTHROPIC_API_KEY is not set; export it in this shell")?;
+    let brain = nana_llm::ClaudeBrain::new(key, model)?;
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build()?;
+
+    for run in 1..=runs.max(1) {
+        let request = BrainRequest {
+            system: system.clone().unwrap_or_else(|| ASK_SYSTEM.to_string()),
+            messages: vec![Message { role: Role::User, content: text.to_string() }],
+            max_tokens,
+        };
+        let started = Instant::now();
+        let mut first_token = None;
+        runtime.block_on(async {
+            let mut stream = brain.stream(request);
+            while let Some(event) = stream.next().await {
+                match event? {
+                    BrainEvent::Text(piece) => {
+                        first_token.get_or_insert_with(|| started.elapsed());
+                        print!("{piece}");
+                        std::io::Write::flush(&mut std::io::stdout())?;
+                    }
+                    BrainEvent::Done { usage, stop_reason } => {
+                        println!(
+                            "\n[run {run}] first token {} ms, total {} ms, stop {:?}",
+                            first_token.map_or(0, |d| d.as_millis()),
+                            started.elapsed().as_millis(),
+                            stop_reason
+                        );
+                        println!(
+                            "         tokens in {} out {}, cache read {} write {}",
+                            usage.input_tokens,
+                            usage.output_tokens,
+                            usage.cache_read_tokens,
+                            usage.cache_write_tokens
+                        );
+                    }
+                }
+            }
+            anyhow::Ok(())
+        })?;
+    }
+    Ok(())
 }
 
 fn wake(action: WakeAction) -> Result<()> {
