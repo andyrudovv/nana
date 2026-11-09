@@ -25,6 +25,8 @@ pub struct WhisperAsr {
     audio_ctx: AudioCtx,
     bounded_latency: bool,
     max_tokens: i32,
+    /// When set, the language is chosen among these instead of all ~100.
+    languages: Option<Vec<Lang>>,
 }
 
 impl WhisperAsr {
@@ -45,6 +47,7 @@ impl WhisperAsr {
             // A spoken command is far shorter than this; the cap only ever
             // truncates a decoder that has stopped making progress.
             max_tokens: 96,
+            languages: None,
         })
     }
 
@@ -57,6 +60,19 @@ impl WhisperAsr {
     /// default and is what makes recognition fit the latency budget.
     pub fn with_audio_ctx(mut self, audio_ctx: AudioCtx) -> Self {
         self.audio_ctx = audio_ctx;
+        self
+    }
+
+    /// Caps decoded tokens. Applies only while latency is bounded.
+    pub fn with_max_tokens(mut self, max_tokens: i32) -> Self {
+        self.max_tokens = max_tokens.max(1);
+        self
+    }
+
+    /// Picks the language among `languages` rather than whisper's whole set.
+    /// On a one-word clip free detection answers Japanese for «Нана».
+    pub fn with_languages(mut self, languages: &[Lang]) -> Self {
+        self.languages = (!languages.is_empty()).then(|| languages.to_vec());
         self
     }
 
@@ -90,17 +106,13 @@ impl Asr for WhisperAsr {
 }
 
 impl WhisperAsr {
-    fn decode(&self, pcm: &[i16], audio_ctx: AudioCtx) -> Result<Transcript> {
-        let audio = to_f32(pcm);
+    fn params(&self, pcm_len: usize, audio_ctx: AudioCtx) -> FullParams<'static, 'static> {
         let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
         params.set_n_threads(self.threads);
-        let seconds = pcm.len() as f32 / nana_core::audio::SAMPLE_RATE as f32;
+        let seconds = pcm_len as f32 / nana_core::audio::SAMPLE_RATE as f32;
         if let Some(ctx) = audio_ctx.frames(seconds) {
             params.set_audio_ctx(ctx);
         }
-        // "auto" makes whisper detect the language while decoding; the separate
-        // detect_language flag stops after detection and returns no text.
-        params.set_language(Some("auto"));
         params.set_translate(false);
         // Each turn stands alone. Left on, whisper conditions the decode on the
         // previous utterance's tokens: a warm-up on silence was enough to make
@@ -118,8 +130,53 @@ impl WhisperAsr {
             params.set_temperature_inc(0.0);
             params.set_max_tokens(self.max_tokens);
         }
+        params
+    }
 
+    /// Best of `candidates` by whisper's own language probabilities.
+    fn pick_language(
+        &self,
+        state: &mut WhisperState,
+        audio: &[f32],
+        audio_ctx: AudioCtx,
+        candidates: &[Lang],
+    ) -> Result<Lang> {
+        // A detect-only pass leaves the mel in the state and records this
+        // clip's audio_ctx, which lang_detect reads: a stale one from an
+        // earlier, longer clip would truncate the encoder input.
+        let mut params = self.params(audio.len(), audio_ctx);
+        params.set_language(Some("auto"));
+        params.set_detect_language(true);
+        state.full(params, audio).map_err(|e| Error::Asr(e.to_string()))?;
+        let (_, probs) =
+            state.lang_detect(0, self.threads as usize).map_err(|e| Error::Asr(e.to_string()))?;
+
+        let probability = |lang: Lang| {
+            whisper_rs::get_lang_id(lang.code()).and_then(|id| probs.get(id as usize)).copied()
+        };
+        candidates
+            .iter()
+            .copied()
+            .filter_map(|l| probability(l).map(|p| (l, p)))
+            .max_by(|a, b| a.1.total_cmp(&b.1))
+            .map(|(l, _)| l)
+            .ok_or_else(|| Error::Asr("no candidate language has a probability".into()))
+    }
+
+    fn decode(&self, pcm: &[i16], audio_ctx: AudioCtx) -> Result<Transcript> {
+        let audio = to_f32(pcm);
         let mut state = self.state.lock().map_err(|_| Error::Asr("state poisoned".into()))?;
+
+        let language = match &self.languages {
+            Some(candidates) => {
+                self.pick_language(&mut state, &audio, audio_ctx, candidates)?.code()
+            }
+            // "auto" makes whisper detect the language while decoding; the separate
+            // detect_language flag stops after detection and returns no text.
+            None => "auto",
+        };
+        let mut params = self.params(audio.len(), audio_ctx);
+        params.set_language(Some(language));
         state.full(params, &audio).map_err(|e| Error::Asr(e.to_string()))?;
 
         let mut text = String::new();

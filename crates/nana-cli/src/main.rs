@@ -9,6 +9,7 @@ use nana_audio::pipewire::PwDump;
 use nana_audio::registry::{AudioTopology, NodeDirection};
 use nana_audio::{classify_output, DesktopEndpoints};
 use nana_core::endpoint::{AecMode, OutputClass};
+use nana_core::lang::Lang;
 use nana_core::ports::Asr;
 use nana_vad::{
     EndReason, EndpointConfig, Endpointer, SilenceMode, SileroVad, VadEvent, WINDOW_MS,
@@ -265,7 +266,12 @@ fn wake_listen(wakeword: &Path, threshold: f32, seconds: f32, verbose: bool) -> 
     let mut spotter = Spotter::load(wakeword, threshold)?;
     let mut vad = SileroVad::load("models/silero_vad.onnx")?;
     let mut gate = PreTriggerSilence::new(300, 900, 0.5);
-    let asr = WhisperAsr::load("models/ggml-base.bin").context("loading the recogniser")?;
+    // One word is all the transcript has to show: pin the language to ours and
+    // cap the decode so a short clip cannot loop.
+    let asr = WhisperAsr::load("models/ggml-base.bin")
+        .context("loading the recogniser")?
+        .with_languages(&[Lang::Ru, Lang::En])
+        .with_max_tokens(12);
     asr.warm_up()?;
 
     let capture = Capture::start_default().context("could not open the default microphone")?;
@@ -320,8 +326,9 @@ fn wake_listen(wakeword: &Path, threshold: f32, seconds: f32, verbose: bool) -> 
             stats.rejected_by_transcript += 1;
             if verbose {
                 println!(
-                    "  [{at:5.1}s] rejected: heard {:?}, score {:.3}",
+                    "  [{at:5.1}s] rejected: heard {:?} ({:?}), score {:.3}",
                     transcript.text.trim(),
+                    transcript.lang,
                     detection.score
                 );
             }
